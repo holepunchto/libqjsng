@@ -1,0 +1,41 @@
+diff --git a/quickjs.c b/quickjs.c
+index d0fdd8c..cd63042 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -5022,6 +5022,20 @@ static void js_free_cstring(JSRuntime *rt, const void *ptr)
+     JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, (JSString *)ptr - 1));
+ }
+ 
++const void *JS_GetStringBuffer(JSValueConst val, size_t *plen, bool *pwide)
++{
++    JSString *p;
++
++    if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
++        return NULL;
++    p = JS_VALUE_GET_STRING(val);
++    *plen = p->len;
++    *pwide = p->is_wide_char;
++    if (p->is_wide_char)
++        return str16(p);
++    return str8(p);
++}
++
+ void JS_FreeCString(JSContext *ctx, const char *ptr)
+ {
+     return js_free_cstring(ctx->rt, ptr);
+diff --git a/quickjs.h b/quickjs.h
+index 06ba278..2d92559 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -935,6 +935,11 @@ static inline const uint16_t *JS_ToCStringUTF16(JSContext *ctx,
+ {
+     return JS_ToCStringLenUTF16(ctx, NULL, val1);
+ }
++/* Returns the characters of 'val', which are Latin-1 if '*pwide' is false and
++   UTF-16 otherwise, and sets '*plen' to their number. The string must be flat,
++   such as one returned by JS_ToString(), or NULL is returned. The characters
++   remain valid for as long as the string is alive. */
++JS_EXTERN const void *JS_GetStringBuffer(JSValueConst val, size_t *plen, bool *pwide);
+ JS_EXTERN void JS_FreeCString(JSContext *ctx, const char *ptr);
+ JS_EXTERN void JS_FreeCStringRT(JSRuntime *rt, const char *ptr);
+ JS_EXTERN void JS_FreeCStringUTF16(JSContext *ctx, const uint16_t *ptr);

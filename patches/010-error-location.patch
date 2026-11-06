@@ -1,0 +1,165 @@
+diff --git a/quickjs.c b/quickjs.c
+index d05e342..100ed19 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -416,6 +416,8 @@ struct JSRuntime {
+     JSReallocArrayBufferDataFunc *ab_realloc_func;
+     void *ab_realloc_opaque;
+     JSGCHook *gc_hook;
++    /* private symbol under which errors record where they were created */
++    JSAtom error_location_atom;
+     void *gc_hook_opaque;
+ 
+     bool can_block; /* true if Atomics.wait can block */
+@@ -2717,6 +2719,9 @@ void JS_FreeRuntime(JSRuntime *rt)
+ 
+     assert(list_empty(&rt->gc_obj_list));
+ 
++    if (rt->error_location_atom != JS_ATOM_NULL)
++        JS_FreeAtomRT(rt, rt->error_location_atom);
++
+     /* free the classes */
+     for(i = 0; i < rt->class_count; i++) {
+         JSClass *cl = &rt->class_array[i];
+@@ -8232,6 +8237,114 @@ static bool can_store_error_stack(JSValueConst obj)
+ #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
+ #define JS_BACKTRACE_FLAG_FILTER_FUNC      (1 << 2)
+ 
++static JSAtom js_get_error_location_atom(JSContext *ctx)
++{
++    JSRuntime *rt = ctx->rt;
++    JSValue sym;
++
++    if (rt->error_location_atom == JS_ATOM_NULL) {
++        sym = JS_NewPrivateSymbol(ctx, "errorLocation");
++        if (JS_IsException(sym))
++            return JS_ATOM_NULL;
++        rt->error_location_atom = JS_ValueToAtom(ctx, sym);
++        JS_FreeValue(ctx, sym);
++    }
++    return rt->error_location_atom;
++}
++
++/* Record on an error where it was created: the location given for a parse
++   error, or otherwise the innermost frame of the stack that has one. */
++static void record_error_location(JSContext *ctx, JSValueConst error_val,
++                                  JSValueConst filter_func,
++                                  const char *filename, int line_num,
++                                  int col_num, int backtrace_flags)
++{
++    JSStackFrame *sf, *sf_start;
++    JSFunctionBytecode *b;
++    JSValue saved_exception, loc, values[3];
++    JSValue name = JS_UNDEFINED;
++    JSObject *p;
++    JSAtom atom;
++    uint32_t pc;
++
++    if (JS_GetClassID(error_val) != JS_CLASS_ERROR)
++        return;
++    saved_exception = JS_GetException(ctx);
++    if (filename) {
++        name = JS_NewString(ctx, filename);
++    } else {
++        sf_start = ctx->rt->current_stack_frame;
++        if (backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC) {
++            for (sf = sf_start; sf != NULL; sf = sf->prev_frame) {
++                if (js_same_value(ctx, sf->cur_func, filter_func)) {
++                    sf_start = sf;
++                    break;
++                }
++            }
++        }
++        for (sf = sf_start; sf != NULL; sf = sf->prev_frame) {
++            if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
++                backtrace_flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
++                continue;
++            }
++            p = JS_VALUE_GET_OBJ(sf->cur_func);
++            if (!js_class_has_bytecode(p->class_id) || !sf->cur_pc)
++                continue;
++            b = p->u.func.function_bytecode;
++            if (!b->filename)
++                continue;
++            pc = sf->cur_pc - b->byte_code_buf - 1;
++            line_num = find_line_num(ctx, b, pc, &col_num);
++            name = JS_AtomToString(ctx, b->filename);
++            break;
++        }
++    }
++    if (JS_IsUndefined(name))
++        goto done;
++    atom = js_get_error_location_atom(ctx);
++    if (atom == JS_ATOM_NULL || JS_IsException(name)) {
++        JS_FreeValue(ctx, name);
++        goto done;
++    }
++    values[0] = name;
++    values[1] = js_int32(line_num);
++    values[2] = js_int32(col_num);
++    loc = JS_NewArrayFrom(ctx, countof(values), values);
++    if (JS_IsException(loc))
++        goto done;
++    JS_DefinePropertyValue(ctx, error_val, atom, loc,
++                           JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
++ done:
++    JS_FreeValue(ctx, JS_GetException(ctx));
++    JS_Throw(ctx, saved_exception);
++}
++
++int JS_GetErrorLocation(JSContext *ctx, JSValueConst error,
++                        JSValue *pfilename, int *pline_num, int *pcol_num)
++{
++    JSAtom atom = ctx->rt->error_location_atom;
++    JSValue loc;
++    int line_num, col_num;
++
++    if (atom == JS_ATOM_NULL || JS_GetClassID(error) != JS_CLASS_ERROR)
++        return -1;
++    loc = JS_GetProperty(ctx, error, atom);
++    if (!JS_IsArray(loc)) {
++        JS_FreeValue(ctx, loc);
++        return -1;
++    }
++    if (pfilename)
++        *pfilename = JS_GetPropertyUint32(ctx, loc, 0);
++    JS_ToInt32Free(ctx, &line_num, JS_GetPropertyUint32(ctx, loc, 1));
++    JS_ToInt32Free(ctx, &col_num, JS_GetPropertyUint32(ctx, loc, 2));
++    JS_FreeValue(ctx, loc);
++    if (pline_num)
++        *pline_num = line_num;
++    if (pcol_num)
++        *pcol_num = col_num;
++    return 0;
++}
++
+ /* if filename != NULL, an additional level is added with the filename
+    and line number information (used for parse error). */
+ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+@@ -8256,6 +8369,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+     if (rt->in_build_stack_trace)
+         return;
+     rt->in_build_stack_trace = true;
++    record_error_location(ctx, error_val, filter_func, filename, line_num,
++                          col_num, backtrace_flags);
+     error_obj = js_dup(error_val);
+ 
+     // Save exception because conversion to double may fail.
+diff --git a/quickjs.h b/quickjs.h
+index d390c75..41054cc 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -876,6 +876,13 @@ JS_EXTERN JSValue JS_PRINTF_FORMAT_ATTR(2, 3) JS_ThrowSyntaxError(JSContext *ctx
+ JS_EXTERN JSValue JS_PRINTF_FORMAT_ATTR(2, 3) JS_ThrowTypeError(JSContext *ctx, JS_PRINTF_FORMAT const char *fmt, ...);
+ JS_EXTERN JSValue JS_PRINTF_FORMAT_ATTR(3, 4) JS_ThrowDOMException(JSContext *ctx, const char *name, JS_PRINTF_FORMAT const char *fmt, ...);
+ JS_EXTERN JSValue JS_ThrowOutOfMemory(JSContext *ctx);
++/* Get the location at which 'error' was created: the name of the file, which
++   must be freed with JS_FreeValue(), and the line and column, both counting
++   from 1. 'pfilename', 'pline_num' and 'pcol_num' may be NULL. Return -1 if
++   the location is not known. */
++JS_EXTERN int JS_GetErrorLocation(JSContext *ctx, JSValueConst error,
++                                  JSValue *pfilename, int *pline_num,
++                                  int *pcol_num);
+ JS_EXTERN void JS_FreeValue(JSContext *ctx, JSValue v);
+ JS_EXTERN void JS_FreeValueRT(JSRuntime *rt, JSValue v);
+ #define JS_FreeValues(ctx, ...) JS_CALLX_(JS_FreeValue, ctx, JS_COUNT_ARGS(__VA_ARGS__), __VA_ARGS__)

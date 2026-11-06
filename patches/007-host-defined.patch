@@ -1,0 +1,183 @@
+diff --git a/quickjs.c b/quickjs.c
+index 1856081..befbbb6 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -895,6 +895,7 @@ typedef struct JSFunctionBytecode {
+     int pc2line_len;
+     uint8_t *pc2line_buf;
+     char *source;
++    JSValue host_defined; /* see JS_SetHostDefined() */
+ } JSFunctionBytecode;
+ 
+ typedef struct JSBoundFunction {
+@@ -7346,6 +7347,7 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
+             for(i = 0; i < b->cpool_count; i++) {
+                 JS_MarkValue(rt, b->cpool[i], mark_func);
+             }
++            JS_MarkValue(rt, b->host_defined, mark_func);
+             if (b->realm)
+                 mark_func(rt, &b->realm->header);
+         }
+@@ -32097,6 +32099,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+     JSValueConst basename_val = argv[2];
+     JSValueConst specifier = argv[3];
+     JSValueConst attributes = argv[4];
++    JSValueConst host_defined = argv[5];
+     JSValue ret, err, token = JS_UNDEFINED;
+     const char *basename = NULL, *filename = NULL;
+ 
+@@ -32122,6 +32125,10 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+                            js_dup(resolving_funcs[1])) < 0) {
+             goto exception;
+         }
++        if (JS_SetPropertyStr(ctx, token, "hostDefined",
++                              js_dup(host_defined)) < 0) {
++            goto exception;
++        }
+         rt->dynamic_import(ctx, basename, filename, token, attributes,
+                            rt->dynamic_import_opaque);
+     } else {
+@@ -32150,7 +32157,9 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+     JSValue promise, resolving_funcs[2], basename_val, err, ret;
+     JSValue specifier_str = JS_UNDEFINED, attributes = JS_UNDEFINED;
+     JSValue attributes_obj = JS_UNDEFINED;
+-    JSValue args[5];
++    JSValue args[6], host_defined;
++    JSStackFrame *sf;
++    JSObject *p;
+ 
+     basename = JS_GetScriptOrModuleName(ctx, 0);
+     if (basename == JS_ATOM_NULL)
+@@ -32161,6 +32170,14 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+     if (JS_IsException(basename_val))
+         return basename_val;
+ 
++    host_defined = JS_UNDEFINED;
++    sf = ctx->rt->current_stack_frame;
++    if (sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT) {
++        p = JS_VALUE_GET_OBJ(sf->cur_func);
++        if (js_class_has_bytecode(p->class_id))
++            host_defined = p->u.func.function_bytecode->host_defined;
++    }
++
+     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+     if (JS_IsException(promise)) {
+         JS_FreeValue(ctx, basename_val);
+@@ -32227,10 +32244,11 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+     args[2] = basename_val;
+     args[3] = specifier_str;
+     args[4] = attributes;
++    args[5] = host_defined;
+ 
+     /* cannot run JS_LoadModuleInternal synchronously because it would
+        cause an unexpected recursion in js_evaluate_module() */
+-    JS_EnqueueJob(ctx, js_dynamic_import_job, 5, vc(args));
++    JS_EnqueueJob(ctx, js_dynamic_import_job, 6, vc(args));
+ done:
+     JS_FreeValue(ctx, basename_val);
+     JS_FreeValue(ctx, resolving_funcs[0]);
+@@ -32267,6 +32285,58 @@ static JSValue js_finish_dynamic_import_job(JSContext *ctx,
+     return ret;
+ }
+ 
++JSValue JS_GetDynamicImportHostDefined(JSContext *ctx, JSValueConst token)
++{
++    return JS_GetPropertyStr(ctx, token, "hostDefined");
++}
++
++static void js_set_host_defined(JSContext *ctx, JSFunctionBytecode *b,
++                                JSValueConst val)
++{
++    int i;
++
++    JS_FreeValue(ctx, b->host_defined);
++    b->host_defined = js_dup(val);
++    for(i = 0; i < b->cpool_count; i++) {
++        if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
++            js_set_host_defined(ctx, JS_VALUE_GET_PTR(b->cpool[i]), val);
++    }
++}
++
++JSValue JS_GetHostDefined(JSValueConst func_obj)
++{
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)
++        return JS_UNDEFINED;
++    p = JS_VALUE_GET_OBJ(func_obj);
++    if (!js_class_has_bytecode(p->class_id))
++        return JS_UNDEFINED;
++    return js_dup(p->u.func.function_bytecode->host_defined);
++}
++
++int JS_SetHostDefined(JSContext *ctx, JSValueConst obj, JSValueConst val)
++{
++    JSValueConst func_obj = obj;
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE)
++        func_obj = ((JSModuleDef *)JS_VALUE_GET_PTR(obj))->func_obj;
++    switch(JS_VALUE_GET_TAG(func_obj)) {
++    case JS_TAG_FUNCTION_BYTECODE:
++        js_set_host_defined(ctx, JS_VALUE_GET_PTR(func_obj), val);
++        return 0;
++    case JS_TAG_OBJECT:
++        p = JS_VALUE_GET_OBJ(func_obj);
++        if (!js_class_has_bytecode(p->class_id))
++            break;
++        js_set_host_defined(ctx, p->u.func.function_bytecode, val);
++        return 0;
++    }
++    JS_ThrowTypeError(ctx, "not a compiled script, module or function");
++    return -1;
++}
++
+ int JS_FinishDynamicImport(JSContext *ctx, JSValue token, JSValue promise,
+                            JSValue exception)
+ {
+@@ -37317,6 +37387,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     b = js_mallocz(ctx, function_size);
+     if (!b)
+         goto fail;
++    b->host_defined = JS_UNDEFINED;
+     JS_REF_COUNT(b) = 1;
+ 
+     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
+@@ -37431,6 +37502,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+     }
+     if (b->realm)
+         JS_FreeContext(b->realm);
++    JS_FreeValueRT(rt, b->host_defined);
+ 
+     JS_FreeAtomRT(rt, b->func_name);
+     JS_FreeAtomRT(rt, b->filename);
+@@ -40022,6 +40094,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+     b = js_mallocz(ctx, function_size);
+     if (!b)
+         goto fail;
++    b->host_defined = JS_UNDEFINED;
+ 
+     memcpy(b, &bc, sizeof(*b));
+     bc.func_name = JS_ATOM_NULL;
+diff --git a/quickjs.h b/quickjs.h
+index 550352e..fdfde7d 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1327,6 +1327,17 @@ JS_EXTERN void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
+ JS_EXTERN int JS_FinishDynamicImport(JSContext *ctx, JSValue token,
+                                      JSValue promise, JSValue exception);
+ 
++/* return the value set with JS_SetHostDefined() on the code that called the
++   import() that |token| belongs to, or JS_UNDEFINED if none */
++JS_EXTERN JSValue JS_GetDynamicImportHostDefined(JSContext *ctx, JSValueConst token);
++
++/* associate a value with a compiled script or module, or with a function, and
++   with every function nested within it. Return -1 if exception. */
++JS_EXTERN int JS_SetHostDefined(JSContext *ctx, JSValueConst obj, JSValueConst val);
++/* return the value set with JS_SetHostDefined() on the code of a function, or
++   JS_UNDEFINED if none */
++JS_EXTERN JSValue JS_GetHostDefined(JSValueConst func_obj);
++
+ /* return the import.meta object of a module */
+ JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
+ JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);

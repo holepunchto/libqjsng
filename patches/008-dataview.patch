@@ -1,0 +1,78 @@
+diff --git a/quickjs.c b/quickjs.c
+index befbbb6..c7f36d2 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62467,23 +62467,47 @@ static JSValue js_dataview_get_buffer(JSContext *ctx, JSValueConst this_val)
+     return js_dup(JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
+ }
+ 
+-static JSValue js_dataview_get_byteLength(JSContext *ctx, JSValueConst this_val)
++static uint32_t js_dataview_get_byte_length(JSTypedArray *ta)
++{
++    if (ta->track_rab)
++        return ta->buffer->u.array_buffer->byte_length - ta->offset;
++    return ta->length;
++}
++
++JSValue JS_NewDataView(JSContext *ctx, int argc, JSValueConst *argv)
++{
++    return js_dataview_constructor(ctx, JS_UNDEFINED, argc, argv);
++}
++
++JSValue JS_GetDataViewBuffer(JSContext *ctx, JSValueConst obj,
++                             size_t *pbyte_offset, size_t *pbyte_length)
+ {
+-    JSArrayBuffer *abuf;
+     JSTypedArray *ta;
+     JSObject *p;
+ 
+-    p = get_dataview(ctx, this_val);
++    p = get_dataview(ctx, obj);
+     if (!p)
+         return JS_EXCEPTION;
+     if (dataview_is_oob(p))
+         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+     ta = p->u.typed_array;
+-    if (ta->track_rab) {
+-        abuf = ta->buffer->u.array_buffer;
+-        return js_uint32(abuf->byte_length - ta->offset);
+-    }
+-    return js_uint32(ta->length);
++    if (pbyte_offset)
++        *pbyte_offset = ta->offset;
++    if (pbyte_length)
++        *pbyte_length = js_dataview_get_byte_length(ta);
++    return js_dup(JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
++}
++
++static JSValue js_dataview_get_byteLength(JSContext *ctx, JSValueConst this_val)
++{
++    JSObject *p;
++
++    p = get_dataview(ctx, this_val);
++    if (!p)
++        return JS_EXCEPTION;
++    if (dataview_is_oob(p))
++        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
++    return js_uint32(js_dataview_get_byte_length(p->u.typed_array));
+ }
+ 
+ static JSValue js_dataview_get_byteOffset(JSContext *ctx, JSValueConst this_val)
+diff --git a/quickjs.h b/quickjs.h
+index fdfde7d..f4351e4 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1174,6 +1174,13 @@ JS_EXTERN JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
+                                          size_t *pbyte_offset,
+                                          size_t *pbyte_length,
+                                          size_t *pbytes_per_element);
++JS_EXTERN JSValue JS_NewDataView(JSContext *ctx, int argc, JSValueConst *argv);
++/* Returns the buffer of a DataView, or an exception if 'obj' is not a
++   DataView or is out of bounds. 'pbyte_offset' and 'pbyte_length' may be
++   NULL. */
++JS_EXTERN JSValue JS_GetDataViewBuffer(JSContext *ctx, JSValueConst obj,
++                                       size_t *pbyte_offset,
++                                       size_t *pbyte_length);
+ JS_EXTERN JSValue JS_NewUint8Array(JSContext *ctx, uint8_t *buf, size_t len,
+                                    JSReallocArrayBufferDataFunc *realloc_func,
+                                    void *opaque, bool is_shared);

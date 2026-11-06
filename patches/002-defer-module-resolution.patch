@@ -1,0 +1,125 @@
+diff --git a/quickjs.c b/quickjs.c
+index b6c91d4..7681b80 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1049,6 +1049,9 @@ struct JSModuleDef {
+     JSModuleInitFunc *init_func; /* only used for C modules */
+     bool has_tla; /* true if func_obj contains await */
+     bool resolved;
++    /* true if the module was compiled or read with its resolution deferred,
++       in which case the embedder owns it until it is resolved */
++    bool deferred;
+     bool func_created;
+     JSModuleStatus status : 8;
+     /* temp use during js_module_link() & js_module_evaluate() */
+@@ -2966,7 +2969,8 @@ static void js_free_modules(JSContext *ctx, JSFreeModuleEnum flag)
+     list_for_each_safe(el, el1, &ctx->loaded_modules) {
+         JSModuleDef *m = list_entry(el, JSModuleDef, link);
+         if (flag == JS_FREE_MODULE_ALL ||
+-            (flag == JS_FREE_MODULE_NOT_RESOLVED && !m->resolved)) {
++            (flag == JS_FREE_MODULE_NOT_RESOLVED && !m->resolved &&
++             !m->deferred)) {
+             js_free_module_def(ctx, m);
+         }
+     }
+@@ -31426,14 +31430,18 @@ static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
+                                                   rme->module_name,
+                                                   rme->attributes);
+         if (!m1)
+-            return -1;
++            goto fail;
+         rme->module = m1;
+         /* already done in js_host_resolve_imported_module() except if
+            the module was loaded with JS_EvalBinary() */
+         if (js_resolve_module(ctx, m1) < 0)
+-            return -1;
++            goto fail;
+     }
+     return 0;
++ fail:
++    /* a deferred module outlives the failure and may be resolved again */
++    m->resolved = false;
++    return -1;
+ }
+ 
+ static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical)
+@@ -38315,6 +38323,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+             m = js_new_module_def(ctx, module_name);
+             if (!m)
+                 return JS_EXCEPTION;
++            m->deferred = (flags & JS_EVAL_FLAG_DEFER_RESOLUTION) != 0;
+             is_strict_mode = true;
+         }
+     }
+@@ -38368,10 +38377,10 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+     fun_obj = js_create_function(ctx, fd);
+     if (JS_IsException(fun_obj))
+         goto fail1;
+-    /* Could add a flag to avoid resolution if necessary */
+     if (m) {
+         m->func_obj = fun_obj;
+-        if (js_resolve_module(ctx, m) < 0)
++        if (!(flags & JS_EVAL_FLAG_DEFER_RESOLUTION) &&
++            js_resolve_module(ctx, m) < 0)
+             goto fail1;
+         fun_obj = JS_NewModuleValue(ctx, m);
+     }
+@@ -39473,6 +39482,7 @@ typedef struct BCReaderState {
+     bool allow_sab;
+     bool allow_bytecode;
+     bool allow_reference;
++    bool defer_resolution;
+     /* object references */
+     JSObject **objects;
+     int objects_count;
+@@ -40088,6 +40098,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
+     m = js_new_module_def(ctx, module_name);
+     if (!m)
+         goto fail;
++    m->deferred = s->defer_resolution;
+     obj = js_dup(JS_MKPTR(JS_TAG_MODULE, m));
+     if (bc_get_leb128_int(s, &m->req_module_entries_count))
+         goto fail;
+@@ -40103,6 +40114,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
+             rme->attributes = JS_UNDEFINED;
+             if (bc_get_atom(s, &rme->module_name))
+                 goto fail;
++            if (s->defer_resolution)
++                continue;
+             // Resolves a module either from the cache or by requesting
+             // it from the module loader. From cache is not ideal because
+             // the module may not be the one it was a time of serialization
+@@ -40718,6 +40731,7 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+     s->buf_end = buf + buf_len;
+     s->ptr = buf;
+     s->allow_bytecode = ((flags & JS_READ_OBJ_BYTECODE) != 0);
++    s->defer_resolution = ((flags & JS_READ_OBJ_DEFER_RESOLUTION) != 0);
+     s->allow_sab = ((flags & JS_READ_OBJ_SAB) != 0);
+     s->allow_reference = ((flags & JS_READ_OBJ_REFERENCE) != 0);
+     if (s->allow_bytecode)
+diff --git a/quickjs.h b/quickjs.h
+index c09ee83..bd9ab03 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -453,7 +453,10 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
+ #define JS_EVAL_TYPE_MASK     (3 << 0)
+ 
+ #define JS_EVAL_FLAG_STRICT   (1 << 3) /* force 'strict' mode */
+-#define JS_EVAL_FLAG_UNUSED   (1 << 4) /* unused */
++/* don't resolve the imports of a module compiled with
++   JS_EVAL_FLAG_COMPILE_ONLY. They must then be resolved with
++   JS_ResolveModule() before the module is evaluated. */
++#define JS_EVAL_FLAG_DEFER_RESOLUTION (1 << 4)
+ /* compile but do not run. The result is an object with a
+    JS_TAG_FUNCTION_BYTECODE or JS_TAG_MODULE tag. It can be executed
+    with JS_EvalFunction(). */
+@@ -1332,6 +1335,9 @@ JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst o
+    writer in the same process (e.g. another Worker on the same runtime). */
+ #define JS_READ_OBJ_SAB       (1 << 2) /* allow SharedArrayBuffer */
+ #define JS_READ_OBJ_REFERENCE (1 << 3) /* allow object references */
++/* don't resolve the imports of a module, which must then be resolved with
++   JS_ResolveModule() before the module is evaluated */
++#define JS_READ_OBJ_DEFER_RESOLUTION (1 << 4)
+ JS_EXTERN JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len, int flags);
+ JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                                  int flags, JSSABTab *psab_tab);

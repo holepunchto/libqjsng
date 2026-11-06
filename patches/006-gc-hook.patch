@@ -1,0 +1,60 @@
+diff --git a/quickjs.c b/quickjs.c
+index cd63042..1856081 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -415,6 +415,8 @@ struct JSRuntime {
+     /* used to manage the data of the ArrayBuffers allocated by the runtime */
+     JSReallocArrayBufferDataFunc *ab_realloc_func;
+     void *ab_realloc_opaque;
++    JSGCHook *gc_hook;
++    void *gc_hook_opaque;
+ 
+     bool can_block; /* true if Atomics.wait can block */
+     uint32_t dump_flags : 24;
+@@ -7512,8 +7514,17 @@ static void gc_free_cycles(JSRuntime *rt)
+     init_list_head(&rt->gc_zero_ref_count_list);
+ }
+ 
++void JS_SetGCHook(JSRuntime *rt, JSGCHook *hook, void *opaque)
++{
++    rt->gc_hook = hook;
++    rt->gc_hook_opaque = opaque;
++}
++
+ void JS_RunGC(JSRuntime *rt)
+ {
++    if (rt->gc_hook)
++        rt->gc_hook(rt, JS_GC_HOOK_BEFORE, rt->gc_hook_opaque);
++
+     /* decrement the reference of the children of each object. mark =
+        1 after this pass. */
+     gc_decref(rt);
+@@ -7523,6 +7534,9 @@ void JS_RunGC(JSRuntime *rt)
+ 
+     /* free the GC objects in a cycle */
+     gc_free_cycles(rt);
++
++    if (rt->gc_hook)
++        rt->gc_hook(rt, JS_GC_HOOK_AFTER, rt->gc_hook_opaque);
+ }
+ 
+ /* Return false if not an object or if the object has already been
+diff --git a/quickjs.h b/quickjs.h
+index 2d92559..550352e 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -535,6 +535,14 @@ typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
+ JS_EXTERN void JS_MarkValue(JSRuntime *rt, JSValueConst val,
+                             JS_MarkFunc *mark_func);
+ JS_EXTERN void JS_RunGC(JSRuntime *rt);
++typedef enum JSGCHookType {
++    JS_GC_HOOK_BEFORE,
++    JS_GC_HOOK_AFTER,
++} JSGCHookType;
++/* Called before and after each garbage collection. The hook must not
++   allocate or run JavaScript. */
++typedef void JSGCHook(JSRuntime *rt, JSGCHookType type, void *opaque);
++JS_EXTERN void JS_SetGCHook(JSRuntime *rt, JSGCHook *hook, void *opaque);
+ JS_EXTERN bool JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
+ 
+ JS_EXTERN JSContext *JS_NewContext(JSRuntime *rt);

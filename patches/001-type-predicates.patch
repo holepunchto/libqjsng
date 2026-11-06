@@ -1,0 +1,96 @@
+diff --git a/quickjs.c b/quickjs.c
+index 8cbc85e..b6c91d4 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -12060,6 +12060,68 @@ bool JS_IsDataView(JSValueConst val)
+     return JS_CLASS_DATAVIEW == JS_GetClassID(val);
+ }
+ 
++bool JS_IsSharedArrayBuffer(JSValueConst val)
++{
++    return JS_CLASS_SHARED_ARRAY_BUFFER == JS_GetClassID(val);
++}
++
++bool JS_IsGeneratorFunction(JSValueConst val)
++{
++    return JS_CLASS_GENERATOR_FUNCTION == JS_GetClassID(val);
++}
++
++bool JS_IsGenerator(JSValueConst val)
++{
++    return JS_CLASS_GENERATOR == JS_GetClassID(val);
++}
++
++bool JS_IsMapIterator(JSValueConst val)
++{
++    return JS_CLASS_MAP_ITERATOR == JS_GetClassID(val);
++}
++
++bool JS_IsSetIterator(JSValueConst val)
++{
++    return JS_CLASS_SET_ITERATOR == JS_GetClassID(val);
++}
++
++bool JS_IsModuleNamespace(JSValueConst val)
++{
++    return JS_CLASS_MODULE_NS == JS_GetClassID(val);
++}
++
++bool JS_IsBooleanObject(JSValueConst val)
++{
++    return JS_CLASS_BOOLEAN == JS_GetClassID(val);
++}
++
++bool JS_IsNumberObject(JSValueConst val)
++{
++    return JS_CLASS_NUMBER == JS_GetClassID(val);
++}
++
++bool JS_IsStringObject(JSValueConst val)
++{
++    return JS_CLASS_STRING == JS_GetClassID(val);
++}
++
++bool JS_IsSymbolObject(JSValueConst val)
++{
++    return JS_CLASS_SYMBOL == JS_GetClassID(val);
++}
++
++bool JS_IsBigIntObject(JSValueConst val)
++{
++    return JS_CLASS_BIG_INT == JS_GetClassID(val);
++}
++
++bool JS_IsArguments(JSValueConst val)
++{
++    JSClassID class_id = JS_GetClassID(val);
++    return class_id == JS_CLASS_ARGUMENTS ||
++           class_id == JS_CLASS_MAPPED_ARGUMENTS;
++}
++
+ bool JS_IsError(JSValueConst val)
+ {
+     return JS_CLASS_ERROR == JS_GetClassID(val);
+diff --git a/quickjs.h b/quickjs.h
+index d0f8a7f..c09ee83 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -955,6 +955,18 @@ JS_EXTERN bool JS_IsWeakRef(JSValueConst val);
+ JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
+ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
+ JS_EXTERN bool JS_IsDataView(JSValueConst val);
++JS_EXTERN bool JS_IsSharedArrayBuffer(JSValueConst val);
++JS_EXTERN bool JS_IsGeneratorFunction(JSValueConst val);
++JS_EXTERN bool JS_IsGenerator(JSValueConst val);
++JS_EXTERN bool JS_IsMapIterator(JSValueConst val);
++JS_EXTERN bool JS_IsSetIterator(JSValueConst val);
++JS_EXTERN bool JS_IsModuleNamespace(JSValueConst val);
++JS_EXTERN bool JS_IsBooleanObject(JSValueConst val);
++JS_EXTERN bool JS_IsNumberObject(JSValueConst val);
++JS_EXTERN bool JS_IsStringObject(JSValueConst val);
++JS_EXTERN bool JS_IsSymbolObject(JSValueConst val);
++JS_EXTERN bool JS_IsBigIntObject(JSValueConst val);
++JS_EXTERN bool JS_IsArguments(JSValueConst val);
+ 
+ JS_EXTERN JSValue JS_NewArray(JSContext *ctx);
+ // takes ownership of the values

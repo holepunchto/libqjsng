@@ -1,0 +1,110 @@
+diff --git a/quickjs.c b/quickjs.c
+index c90d6d4..d0fdd8c 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -15276,6 +15276,84 @@ int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val)
+     return JS_ToBigInt64Free(ctx, (int64_t *)pres, js_dup(val));
+ }
+ 
++JSValue JS_NewBigIntWords(JSContext *ctx, int sign, const uint64_t *words,
++                          size_t len)
++{
++    JSBigInt *r;
++    js_limb_t v, carry;
++    size_t i, n;
++
++    /* two limbs per word and one more for the sign */
++    if (len > (JS_BIGINT_MAX_SIZE - 1) / 2)
++        return JS_ThrowRangeError(ctx, "BigInt is too large to allocate");
++    n = len * 2 + 1;
++    r = js_bigint_new(ctx, n);
++    if (!r)
++        return JS_EXCEPTION;
++    for(i = 0; i < len; i++) {
++        r->tab[2 * i] = (js_limb_t)words[i];
++        r->tab[2 * i + 1] = (js_limb_t)(words[i] >> 32);
++    }
++    r->tab[n - 1] = 0;
++    if (sign) {
++        carry = 1;
++        for(i = 0; i < n; i++) {
++            v = ~r->tab[i] + carry;
++            carry = carry && v == 0;
++            r->tab[i] = v;
++        }
++    }
++    r = js_bigint_normalize(ctx, r);
++    if (!r)
++        return JS_EXCEPTION;
++    return JS_CompactBigInt(ctx, r);
++}
++
++int JS_ToBigIntWords(JSContext *ctx, JSValueConst val, int *psign,
++                     uint64_t *words, size_t *plen)
++{
++    JSBigIntBuf buf;
++    JSBigInt *a;
++    js_limb_t v, carry;
++    size_t i, len, capacity;
++    int sign;
++
++    switch(JS_VALUE_GET_TAG(val)) {
++    case JS_TAG_SHORT_BIG_INT:
++        a = js_bigint_set_short(&buf, val);
++        break;
++    case JS_TAG_BIG_INT:
++        a = JS_VALUE_GET_PTR(val);
++        break;
++    default:
++        JS_ThrowTypeError(ctx, "not a BigInt");
++        return -1;
++    }
++    sign = js_bigint_sign(a);
++    capacity = words ? *plen : 0;
++    len = 0;
++    carry = 1;
++    for(i = 0; i < a->len; i++) {
++        v = a->tab[i];
++        if (sign) {
++            v = ~v + carry;
++            carry = carry && v == 0;
++        }
++        if (v != 0)
++            len = i / 2 + 1;
++        if (i / 2 < capacity) {
++            if (i % 2 == 0)
++                words[i / 2] = v;
++            else
++                words[i / 2] |= (uint64_t)v << 32;
++        }
++    }
++    if (psign)
++        *psign = sign;
++    *plen = len;
++    return 0;
++}
++
+ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
+                                                      JSValue *sp,
+                                                      OPCodeEnum op)
+diff --git a/quickjs.h b/quickjs.h
+index f3a9a9b..06ba278 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -891,6 +891,16 @@ JS_EXTERN int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
+ /* return an exception if 'val' is a Number */
+ JS_EXTERN int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
+ JS_EXTERN int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val);
++/* Creates a BigInt from the 'len' 64-bit words of its magnitude, ordered
++   from least to most significant, negated if 'sign' is non-zero. */
++JS_EXTERN JSValue JS_NewBigIntWords(JSContext *ctx, int sign,
++                                    const uint64_t *words, size_t len);
++/* Gets the sign of a BigInt and the 64-bit words of its magnitude, ordered
++   from least to most significant. At most '*plen' words are written to
++   'words', which may be NULL, and '*plen' is then set to the number of words
++   in the magnitude. Returns -1 if 'val' is not a BigInt. */
++JS_EXTERN int JS_ToBigIntWords(JSContext *ctx, JSValueConst val, int *psign,
++                               uint64_t *words, size_t *plen);
+ /* same as JS_ToInt64() but allow BigInt */
+ JS_EXTERN int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
+ 

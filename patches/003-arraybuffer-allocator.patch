@@ -1,0 +1,179 @@
+diff --git a/quickjs.c b/quickjs.c
+index 7681b80..c90d6d4 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -412,6 +412,9 @@ struct JSRuntime {
+ 
+     /* used to allocate, free and clone SharedArrayBuffers */
+     JSSharedArrayBufferFunctions sab_funcs;
++    /* used to manage the data of the ArrayBuffers allocated by the runtime */
++    JSReallocArrayBufferDataFunc *ab_realloc_func;
++    void *ab_realloc_opaque;
+ 
+     bool can_block; /* true if Atomics.wait can block */
+     uint32_t dump_flags : 24;
+@@ -1442,6 +1445,7 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
+                                             void *opaque, bool alloc_flag);
+ static void *js_array_buffer_realloc(JSRuntime *rt, void *opaque, void *ptr,
+                                      size_t size);
++static uint8_t *js_array_buffer_alloc(JSContext *ctx, size_t len);
+ static JSArrayBuffer *js_get_array_buffer(JSContext *ctx, JSValueConst obj);
+ static bool array_buffer_is_resizable(const JSArrayBuffer *abuf);
+ static JSValue js_typed_array_constructor(JSContext *ctx,
+@@ -2489,6 +2493,14 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
+     rt->sab_funcs = *sf;
+ }
+ 
++void JS_SetArrayBufferReallocFunc(JSRuntime *rt,
++                                  JSReallocArrayBufferDataFunc *realloc_func,
++                                  void *opaque)
++{
++    rt->ab_realloc_func = realloc_func;
++    rt->ab_realloc_opaque = opaque;
++}
++
+ /* return 0 if OK, < 0 if exception */
+ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                   int argc, JSValueConst *argv)
+@@ -59314,24 +59326,30 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
+             if (!abuf->data)
+                 goto fail;
+             memset(abuf->data, 0, sab_alloc_len);
++            /* the memory is managed by the SAB functions instead */
++            realloc_func = NULL;
+         } else {
+             /* the allocation must be done after the object creation */
+-            abuf->data = js_mallocz(ctx, max_int(len, 1));
++            abuf->data = js_array_buffer_alloc(ctx, len);
+             if (!abuf->data)
+                 goto fail;
+         }
+     } else {
++        /* a SharedArrayBuffer with a realloc function is externally managed
++           and so not handled by the SAB functions */
+         if (class_id == JS_CLASS_SHARED_ARRAY_BUFFER &&
+-            rt->sab_funcs.sab_dup) {
++            rt->sab_funcs.sab_dup && !realloc_func) {
+             rt->sab_funcs.sab_dup(rt->sab_funcs.sab_opaque, buf);
+         }
+-        if (buf) {
++        /* a realloc function manages the data even when there is none */
++        if (buf || realloc_func) {
+             abuf->data = buf;
+         } else {
+-            abuf->data = js_mallocz(ctx, 1);
++            abuf->data = js_array_buffer_alloc(ctx, 0);
+             if (!abuf->data)
+                 goto fail;
+             realloc_func = js_array_buffer_realloc;
++            opaque = NULL;
+         }
+     }
+     init_list_head(&abuf->array_list);
+@@ -59353,9 +59371,24 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
+ static void *js_array_buffer_realloc(JSRuntime *rt, void *opaque, void *ptr,
+                                      size_t size)
+ {
++    if (rt->ab_realloc_func)
++        return rt->ab_realloc_func(rt, rt->ab_realloc_opaque, ptr, size);
+     return js_realloc_rt(rt, ptr, size);
+ }
+ 
++static uint8_t *js_array_buffer_alloc(JSContext *ctx, size_t len)
++{
++    uint8_t *data;
++
++    data = js_array_buffer_realloc(ctx->rt, NULL, NULL, max_int(len, 1));
++    if (!data) {
++        JS_ThrowOutOfMemory(ctx);
++        return NULL;
++    }
++    memset(data, 0, max_int(len, 1));
++    return data;
++}
++
+ static JSValue js_array_buffer_constructor2(JSContext *ctx,
+                                             JSValueConst new_target,
+                                             uint64_t len, uint64_t *max_len,
+@@ -59483,7 +59516,7 @@ static void js_array_buffer_finalizer(JSRuntime *rt, JSValueConst val)
+                 p1->u.array.u.ptr = NULL;
+             }
+         }
+-        if (abuf->shared && rt->sab_funcs.sab_free) {
++        if (abuf->shared && rt->sab_funcs.sab_free && !abuf->realloc_func) {
+             rt->sab_funcs.sab_free(rt->sab_funcs.sab_opaque, abuf->data);
+         } else {
+             if (abuf->realloc_func)
+@@ -59648,6 +59681,30 @@ static JSArrayBuffer *js_get_array_buffer(JSContext *ctx, JSValueConst obj)
+ 
+ /* return NULL if exception. WARNING: any JS call can detach the
+    buffer and render the returned pointer invalid */
++JSReallocArrayBufferDataFunc *JS_GetArrayBufferReallocFunc(JSValueConst obj,
++                                                           void **popaque)
++{
++    JSClassID class_id = JS_GetClassID(obj);
++    JSArrayBuffer *abuf;
++
++    *popaque = NULL;
++    if (class_id != JS_CLASS_ARRAY_BUFFER &&
++        class_id != JS_CLASS_SHARED_ARRAY_BUFFER)
++        return NULL;
++    abuf = JS_VALUE_GET_OBJ(obj)->u.array_buffer;
++    if (abuf->detached)
++        return NULL;
++    *popaque = abuf->opaque;
++    return abuf->realloc_func;
++}
++
++bool JS_IsDetachedArrayBuffer(JSValueConst obj)
++{
++    if (JS_GetClassID(obj) != JS_CLASS_ARRAY_BUFFER)
++        return false;
++    return JS_VALUE_GET_OBJ(obj)->u.array_buffer->detached;
++}
++
+ uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj)
+ {
+     JSArrayBuffer *abuf = js_get_array_buffer(ctx, obj);
+diff --git a/quickjs.h b/quickjs.h
+index bd9ab03..f3a9a9b 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1106,7 +1106,10 @@ typedef void *JSReallocArrayBufferDataFunc(JSRuntime *rt, void *opaque,
+    by quickjs at all; such an ArrayBuffer can neither be resized nor
+    transferred to a different length. It is required for resizable
+    ArrayBuffers, except for SharedArrayBuffers: those commit their maximum size
+-   upfront and therefore need 'buf' to be at least 'max_len' bytes big. */
++   upfront and therefore need 'buf' to be at least 'max_len' bytes big. A
++   SharedArrayBuffer with a 'realloc_func' is managed by it rather than by the
++   JSSharedArrayBufferFunctions. 'buf' may be NULL with a 'realloc_func', which
++   is then still called to release the ArrayBuffer. */
+ JS_EXTERN JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
+                                     size_t max_len,
+                                     JSReallocArrayBufferDataFunc *realloc_func,
+@@ -1115,6 +1118,12 @@ JS_EXTERN JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size
+ JS_EXTERN void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
+ JS_EXTERN uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj);
+ JS_EXTERN bool JS_IsArrayBuffer(JSValueConst obj);
++JS_EXTERN bool JS_IsDetachedArrayBuffer(JSValueConst obj);
++/* Returns the function that manages the data of an ArrayBuffer or
++   SharedArrayBuffer and sets '*popaque' to its opaque value, or returns NULL
++   if 'obj' is detached, not an ArrayBuffer, or has no such function. */
++JS_EXTERN JSReallocArrayBufferDataFunc *JS_GetArrayBufferReallocFunc(JSValueConst obj,
++                                                                     void **popaque);
+ // returns true or false if obj is an ArrayBuffer, -1 otherwise
+ JS_EXTERN int JS_IsImmutableArrayBuffer(JSValueConst obj);
+ // returns 0 if obj is an ArrayBuffer, -1 otherwise
+@@ -1155,6 +1164,12 @@ typedef struct {
+     void *sab_opaque;
+ } JSSharedArrayBufferFunctions;
+ JS_EXTERN void JS_SetSharedArrayBufferFunctions(JSRuntime *rt, const JSSharedArrayBufferFunctions *sf);
++/* Manages the data of the ArrayBuffers that the runtime allocates itself, in
++   place of the runtime allocator. It is also called with a NULL 'ptr' to
++   allocate new data. */
++JS_EXTERN void JS_SetArrayBufferReallocFunc(JSRuntime *rt,
++                                            JSReallocArrayBufferDataFunc *realloc_func,
++                                            void *opaque);
+ 
+ typedef enum JSPromiseStateEnum {
+     // argument to JS_PromiseState() was not in fact a promise
