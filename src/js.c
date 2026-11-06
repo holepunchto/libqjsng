@@ -3695,9 +3695,9 @@ js_create_array_with_elements(js_env_t *env, js_value_t *const elements[], size_
 
   js_value_t *wrapper = js__create_handle(env, env->scope);
 
-  JSValue small[16];
+  JSValue stack[16];
 
-  JSValue *values = element_count <= 16 ? small : malloc(element_count * sizeof(JSValue));
+  JSValue *values = element_count <= 16 ? stack : malloc(element_count * sizeof(JSValue));
 
   for (size_t i = 0; i < element_count; i++) {
     values[i] = JS_DupValue(env->context, elements[i]->value);
@@ -3705,7 +3705,7 @@ js_create_array_with_elements(js_env_t *env, js_value_t *const elements[], size_
 
   wrapper->value = JS_NewArrayFrom(env->context, element_count, values);
 
-  if (values != small) free(values);
+  if (values != stack) free(values);
 
   *result = wrapper;
 
