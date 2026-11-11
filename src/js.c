@@ -115,7 +115,7 @@ struct js_env_s {
 
   bool destroying;
 
-  js_promise_rejection_t *promise_rejections;
+  intrusive_list_t promise_rejections;
 
   js_teardown_queue_t teardown_queue;
 
@@ -276,7 +276,7 @@ struct js_arraybuffer_backing_store_s {
 struct js_promise_rejection_s {
   JSValue promise;
   JSValue reason;
-  js_promise_rejection_t *next;
+  intrusive_list_node_t list;
 };
 
 static const uint8_t js_threadsafe_function_idle = 0x0;
@@ -355,10 +355,14 @@ static JSClassDef js__function_class = {
   .call = js__on_function_call,
 };
 
+static void
+js__on_microtask_finalize(JSRuntime *runtime, JSValueConst value);
+
 static JSClassID js__microtask_class_id;
 
 static JSClassDef js__microtask_class = {
   .class_name = "Microtask",
+  .finalizer = js__on_microtask_finalize,
 };
 
 static void
@@ -607,39 +611,44 @@ js__on_promise_rejection(JSContext *context, JSValueConst promise, JSValueConst 
   if (env->callbacks.unhandled_rejection == NULL) return;
 
   if (is_handled) {
-    js_promise_rejection_t *next = env->promise_rejections;
-    js_promise_rejection_t *prev = NULL;
+    intrusive_list_for_each(next, &env->promise_rejections) {
+      js_promise_rejection_t *rejection = intrusive_entry(next, js_promise_rejection_t, list);
 
-    while (next) {
-      if (JS_VALUE_GET_PTR(next->promise) == JS_VALUE_GET_PTR(promise)) {
-        JS_FreeValue(context, next->promise);
-        JS_FreeValue(context, next->reason);
+      if (JS_VALUE_GET_PTR(rejection->promise) == JS_VALUE_GET_PTR(promise)) {
+        intrusive_list_remove(&env->promise_rejections, &rejection->list);
 
-        if (prev) prev->next = next->next;
-        else env->promise_rejections = next->next;
+        JS_FreeValue(context, rejection->promise);
+        JS_FreeValue(context, rejection->reason);
 
-        return free(next);
+        return free(rejection);
       }
-
-      prev = next;
-      next = next->next;
     }
   } else {
-    js_promise_rejection_t *node = malloc(sizeof(js_promise_rejection_t));
+    js_promise_rejection_t *rejection = malloc(sizeof(js_promise_rejection_t));
 
-    node->promise = JS_DupValue(context, promise);
-    node->reason = JS_DupValue(context, reason);
-    node->next = env->promise_rejections;
+    rejection->promise = JS_DupValue(context, promise);
+    rejection->reason = JS_DupValue(context, reason);
 
-    env->promise_rejections = node;
+    intrusive_list_append(&env->promise_rejections, &rejection->list);
   }
 }
 
-static inline void
-js__run_microtasks(js_env_t *env) {
-  int err;
+static inline bool
+js__is_terminating(js_env_t *env) {
+  if (!JS_HasException(env->context)) return false;
 
-  env->depth++;
+  JSValue error = JS_GetException(env->context);
+
+  bool terminating = JS_IsUncatchableError(error);
+
+  JS_Throw(env->context, error);
+
+  return terminating;
+}
+
+static inline void
+js__run_pending_jobs(js_env_t *env) {
+  int err;
 
   for (;;) {
     JSContext *context;
@@ -661,24 +670,38 @@ js__run_microtasks(js_env_t *env) {
       assert(err == 0);
     }
   }
+}
 
-  js_promise_rejection_t *next = env->promise_rejections;
-  js_promise_rejection_t *prev = NULL;
+static inline void
+js__run_microtasks(js_env_t *env) {
+  // Terminating execution skips the checkpoint, leaving the queue as it is.
+  if (js__is_terminating(env)) return;
 
-  env->promise_rejections = NULL;
+  env->depth++;
 
-  while (next) {
-    js__on_unhandled_rejection(env->context, next->promise, next->reason);
+  js__run_pending_jobs(env);
 
-    prev = next;
-    next = next->next;
+  while (!intrusive_list_empty(&env->promise_rejections)) {
+    js_promise_rejection_t *rejection = intrusive_entry(env->promise_rejections.head, js_promise_rejection_t, list);
 
-    free(prev);
+    intrusive_list_remove(&env->promise_rejections, &rejection->list);
 
-    js__run_microtasks(env);
+    js__on_unhandled_rejection(env->context, rejection->promise, rejection->reason);
+
+    free(rejection);
+
+    // An exception thrown by the handler is left pending for the caller, and
+    // the remaining rejections for the next checkpoint.
+    if (JS_HasException(env->context)) break;
+
+    js__run_pending_jobs(env);
   }
 
   env->depth--;
+
+  // A checkpoint is where a collection would have run the finalizers of what
+  // the JavaScript just run let go of.
+  js__run_pending_finalizers(env);
 }
 
 static void
@@ -881,6 +904,17 @@ js__run_pending_finalizers(js_env_t *env) {
 
 static void
 js__close_env(js_env_t *env) {
+  intrusive_list_for_each(next, &env->promise_rejections) {
+    js_promise_rejection_t *rejection = intrusive_entry(next, js_promise_rejection_t, list);
+
+    intrusive_list_remove(&env->promise_rejections, &rejection->list);
+
+    JS_FreeValue(env->context, rejection->promise);
+    JS_FreeValue(env->context, rejection->reason);
+
+    free(rejection);
+  }
+
   intrusive_list_for_each(next, &env->deferreds) {
     js_deferred_t *deferred = intrusive_entry(next, js_deferred_t, list);
 
@@ -1015,7 +1049,7 @@ js_create_env(uv_loop_t *loop, js_platform_t *platform, const js_env_options_t *
 
   env->destroying = false;
 
-  env->promise_rejections = NULL;
+  intrusive_list_init(&env->promise_rejections);
 
   intrusive_list_init(&env->deferreds);
   intrusive_list_init(&env->synthetic_modules);
@@ -1574,9 +1608,13 @@ int
 js_create_context(js_env_t *env, js_context_t **result) {
   // Allow continuing even with a pending exception
 
+  JSContext *local = JS_NewContext(env->runtime);
+
+  if (local == NULL) return js__error(env);
+
   js_context_t *context = malloc(sizeof(js_context_t));
 
-  context->context = JS_NewContext(env->runtime);
+  context->context = local;
   context->previous = NULL;
 
   *result = context;
@@ -3750,11 +3788,15 @@ js_create_external(js_env_t *env, void *data, js_finalize_cb finalize_cb, void *
 
 int
 js_create_date(js_env_t *env, double time, js_value_t **result) {
-  // Allow continuing even with a pending exception
+  if (JS_HasException(env->context)) return js__error(env);
+
+  JSValue date = JS_NewDate(env->context, time);
+
+  if (JS_IsException(date)) return js__error(env);
 
   js_value_t *wrapper = js__create_handle(env, env->scope);
 
-  wrapper->value = JS_NewDate(env->context, time);
+  wrapper->value = date;
 
   *result = wrapper;
 
@@ -3770,7 +3812,7 @@ js__create_error(js_env_t *env, js_error_constructor_t constructor, JSValueConst
   JS_DefinePropertyValueStr(env->context, error, "message", message, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
 
   if (!JS_IsUndefined(code)) {
-    JS_SetPropertyStr(env->context, error, "code", JS_DupValue(env->context, code));
+    JS_DefinePropertyValueStr(env->context, error, "code", JS_DupValue(env->context, code), JS_PROP_C_W_E);
   }
 
   return error;
@@ -3890,15 +3932,19 @@ js_get_error_location(js_env_t *env, js_value_t *error, js_error_location_t *res
 
 int
 js_create_promise(js_env_t *env, js_deferred_t **deferred, js_value_t **promise) {
-  // Allow continuing even with a pending exception
+  if (JS_HasException(env->context)) return js__error(env);
+
+  JSValue functions[2];
+
+  JSValue value = JS_NewPromiseCapability(env->context, functions);
+
+  if (JS_IsException(value)) return js__error(env);
 
   *deferred = malloc(sizeof(js_deferred_t));
 
   js_value_t *wrapper = js__create_handle(env, env->scope);
 
-  JSValue functions[2];
-
-  wrapper->value = JS_NewPromiseCapability(env->context, functions);
+  wrapper->value = value;
 
   (*deferred)->resolve = functions[0];
   (*deferred)->reject = functions[1];
@@ -3914,13 +3960,15 @@ js_create_promise(js_env_t *env, js_deferred_t **deferred, js_value_t **promise)
 
 static inline int
 js__conclude_deferred(js_env_t *env, js_deferred_t *deferred, js_value_t *resolution, bool resolved) {
-  // Allow continuing even with a pending exception
-
   JSValue global = JS_GetGlobalObject(env->context);
+
+  // Resolving with a thenable reads its `then` property, which may run
+  // JavaScript.
+  env->depth++;
 
   JSValue result = JS_Call(env->context, resolved ? deferred->resolve : deferred->reject, global, 1, &resolution->value);
 
-  if (env->depth == 0) js__run_microtasks(env);
+  env->depth--;
 
   JS_FreeValue(env->context, global);
   JS_FreeValue(env->context, result);
@@ -3931,16 +3979,24 @@ js__conclude_deferred(js_env_t *env, js_deferred_t *deferred, js_value_t *resolu
 
   free(deferred);
 
+  if (JS_IsException(result)) return js__report_exception(env);
+
+  if (env->depth == 0) js__run_microtasks(env);
+
   return 0;
 }
 
 int
 js_resolve_deferred(js_env_t *env, js_deferred_t *deferred, js_value_t *resolution) {
+  if (JS_HasException(env->context)) return js__error(env);
+
   return js__conclude_deferred(env, deferred, resolution, true);
 }
 
 int
 js_reject_deferred(js_env_t *env, js_deferred_t *deferred, js_value_t *resolution) {
+  if (JS_HasException(env->context)) return js__error(env);
+
   return js__conclude_deferred(env, deferred, resolution, false);
 }
 
@@ -4391,9 +4447,15 @@ int
 js_coerce_to_number(js_env_t *env, js_value_t *value, js_value_t **result) {
   if (JS_HasException(env->context)) return js__error(env);
 
+  env->depth++;
+
   JSValue number = JS_ToNumber(env->context, value->value);
 
-  if (JS_IsException(number)) return js__error(env);
+  if (env->depth == 1) js__run_microtasks(env);
+
+  env->depth--;
+
+  if (JS_IsException(number)) return js__report_exception(env);
 
   js_value_t *wrapper = js__create_handle(env, env->scope);
 
@@ -4408,9 +4470,15 @@ int
 js_coerce_to_string(js_env_t *env, js_value_t *value, js_value_t **result) {
   if (JS_HasException(env->context)) return js__error(env);
 
+  env->depth++;
+
   JSValue string = JS_ToString(env->context, value->value);
 
-  if (JS_IsException(string)) return js__error(env);
+  if (env->depth == 1) js__run_microtasks(env);
+
+  env->depth--;
+
+  if (JS_IsException(string)) return js__report_exception(env);
 
   js_value_t *wrapper = js__create_handle(env, env->scope);
 
@@ -4471,9 +4539,15 @@ int
 js_instanceof(js_env_t *env, js_value_t *object, js_value_t *constructor, bool *result) {
   if (JS_HasException(env->context)) return js__error(env);
 
+  env->depth++;
+
   int success = JS_IsInstanceOf(env->context, object->value, constructor->value);
 
-  if (success < 0) return js__error(env);
+  if (env->depth == 1) js__run_microtasks(env);
+
+  env->depth--;
+
+  if (success < 0) return js__report_exception(env);
 
   *result = success;
 
@@ -4852,6 +4926,15 @@ js_is_detached_arraybuffer(js_env_t *env, js_value_t *value, bool *result) {
   // Allow continuing even with a pending exception
 
   *result = JS_IsDetachedArrayBuffer(value->value);
+
+  return 0;
+}
+
+int
+js_is_detachable_arraybuffer(js_env_t *env, js_value_t *value, bool *result) {
+  // Allow continuing even with a pending exception
+
+  *result = JS_IsArrayBuffer(value->value);
 
   return 0;
 }
@@ -6285,12 +6368,12 @@ js_call_function_with_checkpoint(js_env_t *env, js_value_t *receiver, js_value_t
 
   env->depth--;
 
-  if (JS_IsException(value)) {
-    JSValue error = JS_GetException(env->context);
+  // Within a call into JavaScript, an exception thrown at the checkpoint must
+  // reach that call even if the function itself returned.
+  if (JS_IsException(value) || (env->depth && JS_HasException(env->context))) {
+    JS_FreeValue(env->context, value);
 
-    js__uncaught_exception(env, error);
-
-    return js__error(env);
+    return js__report_exception(env);
   }
 
   if (result == NULL) JS_FreeValue(env->context, value);
@@ -6312,7 +6395,7 @@ js__on_microtask(JSContext *context, int argc, JSValueConst *argv) {
 
 int
 js_queue_microtask(js_env_t *env, js_value_t *function) {
-  // Allow continuing even with a pending exception
+  if (JS_HasException(env->context)) return js__error(env);
 
   JS_EnqueueJob(env->context, js__on_microtask, 1, &function->value);
 
@@ -6321,20 +6404,32 @@ js_queue_microtask(js_env_t *env, js_value_t *function) {
   return 0;
 }
 
+static void
+js__on_microtask_finalize(JSRuntime *runtime, JSValueConst value) {
+  free(JS_GetOpaque(value, js__microtask_class_id));
+}
+
 static JSValue
 js__on_microtask_with_callback(JSContext *context, int argc, JSValueConst *argv) {
+  int err;
+
   js_microtask_t *task = (js_microtask_t *) JS_GetOpaque(argv[0], js__microtask_class_id);
+
+  js_handle_scope_t *scope;
+  err = js_open_handle_scope(task->env, &scope);
+  assert(err == 0);
 
   task->cb(task->env, task->data);
 
-  free(task);
+  err = js_close_handle_scope(task->env, scope);
+  assert(err == 0);
 
-  return JS_UNDEFINED;
+  return JS_HasException(context) ? JS_EXCEPTION : JS_UNDEFINED;
 }
 
 int
 js_queue_microtask_with_callback(js_env_t *env, js_task_cb cb, void *data) {
-  // Allow continuing even with a pending exception
+  if (JS_HasException(env->context)) return js__error(env);
 
   js_microtask_t *task = malloc(sizeof(js_microtask_t));
 
@@ -6730,6 +6825,26 @@ int
 js_add_teardown_callback(js_env_t *env, js_teardown_cb callback, void *data) {
   if (JS_HasException(env->context)) return js__error(env);
 
+  int err;
+
+  if (env->destroying) {
+    err = js_throw_error(env, NULL, "Teardown queue has already drained");
+    assert(err == 0);
+
+    return js__error(env);
+  }
+
+  intrusive_list_for_each(next, &env->teardown_queue.tasks) {
+    js_teardown_task_t *task = intrusive_entry(next, js_teardown_task_t, list);
+
+    if (task->type == js_immediate_teardown && task->immediate.cb == callback && task->data == data) {
+      err = js_throw_error(env, NULL, "Teardown callback has already been registered");
+      assert(err == 0);
+
+      return js__error(env);
+    }
+  }
+
   js_teardown_task_t *task = malloc(sizeof(js_teardown_task_t));
 
   task->type = js_immediate_teardown;
@@ -6745,6 +6860,8 @@ int
 js_remove_teardown_callback(js_env_t *env, js_teardown_cb callback, void *data) {
   if (JS_HasException(env->context)) return js__error(env);
 
+  int err;
+
   if (env->destroying) return 0;
 
   intrusive_list_for_each(next, &env->teardown_queue.tasks) {
@@ -6759,12 +6876,35 @@ js_remove_teardown_callback(js_env_t *env, js_teardown_cb callback, void *data) 
     }
   }
 
-  return 0;
+  err = js_throw_error(env, NULL, "Teardown callback has not been registered");
+  assert(err == 0);
+
+  return js__error(env);
 }
 
 int
 js_add_deferred_teardown_callback(js_env_t *env, js_deferred_teardown_cb callback, void *data, js_deferred_teardown_t **result) {
   if (JS_HasException(env->context)) return js__error(env);
+
+  int err;
+
+  if (env->destroying) {
+    err = js_throw_error(env, NULL, "Teardown queue has already drained");
+    assert(err == 0);
+
+    return js__error(env);
+  }
+
+  intrusive_list_for_each(next, &env->teardown_queue.tasks) {
+    js_teardown_task_t *task = intrusive_entry(next, js_teardown_task_t, list);
+
+    if (task->type == js_deferred_teardown && task->deferred.cb == callback && task->data == data) {
+      err = js_throw_error(env, NULL, "Teardown callback has already been registered");
+      assert(err == 0);
+
+      return js__error(env);
+    }
+  }
 
   js_teardown_task_t *task = malloc(sizeof(js_teardown_task_t));
 
@@ -7076,6 +7216,8 @@ js_get_and_clear_last_exception(js_env_t *env, js_value_t **result) {
 int
 js_fatal_exception(js_env_t *env, js_value_t *error) {
   // Allow continuing even with a pending exception
+
+  if (env->callbacks.uncaught_exception == NULL) return 0;
 
   js__uncaught_exception(env, JS_DupValue(env->context, error->value));
 
