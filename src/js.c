@@ -141,7 +141,6 @@ struct js_value_s {
 
 struct js_unit_s {
   JSValue id;
-  uint64_t source_hash;
   js_dynamic_import_cb dynamic_import;
   void *dynamic_import_data;
 };
@@ -1318,7 +1317,7 @@ js__on_unit_finalize(JSRuntime *runtime, JSValueConst value) {
 }
 
 static JSValue
-js__create_unit(js_env_t *env, const char *name, uint64_t source_hash, JSValueConst code) {
+js__create_unit(js_env_t *env, const char *name, JSValueConst code) {
   JSValue value = JS_NewObjectClass(env->context, js__unit_class_id);
 
   js_unit_t *unit = malloc(sizeof(js_unit_t));
@@ -1326,7 +1325,6 @@ js__create_unit(js_env_t *env, const char *name, uint64_t source_hash, JSValueCo
   // Mint a unique identifier for the code so it can be recovered as the
   // referrer of any dynamic import().
   unit->id = JS_NewSymbol(env->context, name, false);
-  unit->source_hash = source_hash;
   unit->dynamic_import = NULL;
   unit->dynamic_import_data = NULL;
 
@@ -1373,89 +1371,34 @@ js__set_unit_dynamic_import(js_env_t *env, JSValueConst value, js_dynamic_import
   return 0;
 }
 
-// A multiplicative hash taken a word at a time, which a code cache records for
-// the source, name, and offset it was produced from so that it is rejected for
-// any other.
-static inline uint64_t
-js__hash_word(uint64_t hash, uint64_t word) {
-  hash = (hash ^ word) * 0x9e3779b97f4a7c15;
-
-  return hash ^ (hash >> 32);
-}
-
-static uint64_t
-js__hash(uint64_t hash, const void *data, size_t len) {
-  const uint8_t *bytes = (const uint8_t *) data;
-
-  for (; len >= sizeof(uint64_t); bytes += sizeof(uint64_t), len -= sizeof(uint64_t)) {
-    uint64_t word;
-
-    memcpy(&word, bytes, sizeof(word));
-
-    hash = js__hash_word(hash, word);
-  }
-
-  for (; len > 0; bytes++, len--) {
-    hash = js__hash_word(hash, *bytes);
-  }
-
-  return hash;
-}
-
-static uint64_t
-js__hash_source(const char *str, size_t len, const char *name, int offset) {
-  uint64_t hash = 0xcbf29ce484222325;
-
-  hash = js__hash(hash, str, len);
-  hash = js__hash(hash, name, strlen(name) + 1);
-  hash = js__hash(hash, &offset, sizeof(offset));
-
-  return hash;
-}
-
-typedef struct {
-  uint32_t magic;
-  uint32_t reserved;
-  uint64_t source_hash;
-} js_code_cache_header_t;
-
-static const uint32_t js__code_cache_magic = 0x676e6a71;
-
 // Returns `JS_UNINITIALIZED` if there is no usable cache.
 static JSValue
-js__read_code_cache(js_env_t *env, const void *data, size_t len, uint64_t source_hash, int flags, bool *rejected) {
+js__read_code_cache(js_env_t *env, const void *data, size_t len, int flags, bool *rejected) {
   if (data == NULL) return JS_UNINITIALIZED;
 
-  js_code_cache_header_t header;
-
-  if (len < sizeof(header)) goto rejected;
-
-  memcpy(&header, data, sizeof(header));
-
-  if (header.magic != js__code_cache_magic || header.source_hash != source_hash) goto rejected;
-
-  JSValue bytecode = JS_ReadObject(env->context, (const uint8_t *) data + sizeof(header), len - sizeof(header), flags);
+  JSValue bytecode = JS_ReadObject(env->context, (const uint8_t *) data, len, flags);
 
   if (JS_IsException(bytecode)) {
     JS_FreeValue(env->context, JS_GetException(env->context));
 
-    goto rejected;
+    if (rejected) *rejected = true;
+
+    return JS_UNINITIALIZED;
   }
 
   return bytecode;
-
-rejected:
-  if (rejected) *rejected = true;
-
-  return JS_UNINITIALIZED;
 }
 
 static int
-js__create_code_cache(js_env_t *env, JSValueConst bytecode, uint64_t source_hash, void **data, size_t *len) {
+js__create_code_cache(js_env_t *env, JSValueConst bytecode, void **data, size_t *len) {
   int err;
 
+  // The source of each function is left out, as it would otherwise be loaded
+  // back into memory alongside the bytecode. Functions read from the cache
+  // print as native code, but keep the debug information that stack traces
+  // need.
   size_t size;
-  uint8_t *buffer = JS_WriteObject(env->context, &size, bytecode, JS_WRITE_OBJ_BYTECODE);
+  uint8_t *buffer = JS_WriteObject(env->context, &size, bytecode, JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_STRIP_SOURCE);
 
   if (buffer == NULL) {
     if (!JS_HasException(env->context)) {
@@ -1470,24 +1413,17 @@ js__create_code_cache(js_env_t *env, JSValueConst bytecode, uint64_t source_hash
     return js__error(env);
   }
 
-  js_code_cache_header_t header = {
-    .magic = js__code_cache_magic,
-    .reserved = 0,
-    .source_hash = source_hash,
-  };
-
   // `JS_WriteObject()` hands back a buffer owned by QuickJS that must be
   // released with `js_free()`, whereas the caller releases the cache with
   // `free()`.
-  uint8_t *copy = malloc(sizeof(header) + size);
+  uint8_t *copy = malloc(size);
 
-  memcpy(copy, &header, sizeof(header));
-  memcpy(copy + sizeof(header), buffer, size);
+  memcpy(copy, buffer, size);
 
   js_free(env->context, buffer);
 
   *data = copy;
-  *len = sizeof(header) + size;
+  *len = size;
 
   return 0;
 }
@@ -1517,16 +1453,15 @@ js__attach_error_source(js_env_t *env, JSValueConst source) {
   JS_Throw(env->context, error);
 }
 
-// Reads the bytecode from the code cache if it was produced from the same
-// source, or otherwise compiles the source. Returns `JS_EXCEPTION` with the
-// error pending if compiling fails.
+// Reads the bytecode from the code cache, or compiles the source if there is no
+// cache or it can't be read. The cache isn't checked against the source, so one
+// produced from any other source is undefined behavior. Returns `JS_EXCEPTION`
+// with the error pending if compiling fails.
 static JSValue
-js__compile_with_code_cache(js_env_t *env, JSValueConst source, const char *str, size_t len, const char *name, int offset, int eval_flags, int read_flags, const void *cached_data, size_t cached_data_len, bool *cache_rejected, uint64_t *source_hash) {
+js__compile_with_code_cache(js_env_t *env, JSValueConst source, const char *str, size_t len, const char *name, int offset, int eval_flags, int read_flags, const void *cached_data, size_t cached_data_len, bool *cache_rejected) {
   if (cache_rejected) *cache_rejected = false;
 
-  *source_hash = js__hash_source(str, len, name, offset);
-
-  JSValue bytecode = js__read_code_cache(env, cached_data, cached_data_len, *source_hash, read_flags, cache_rejected);
+  JSValue bytecode = js__read_code_cache(env, cached_data, cached_data_len, read_flags, cache_rejected);
 
   if (JS_IsUninitialized(bytecode)) {
     bytecode = js__compile(env, str, len, name, offset, eval_flags);
@@ -1820,9 +1755,7 @@ js_prepare_script_with_code_cache(js_env_t *env, const char *file, size_t len, i
   size_t str_len;
   const char *str = JS_ToCStringLen(env->context, &str_len, source->value);
 
-  uint64_t source_hash;
-
-  JSValue bytecode = js__compile_with_code_cache(env, source->value, str, str_len, name, offset, JS_EVAL_TYPE_GLOBAL, JS_READ_OBJ_BYTECODE, cached_data, cached_data_len, cache_rejected, &source_hash);
+  JSValue bytecode = js__compile_with_code_cache(env, source->value, str, str_len, name, offset, JS_EVAL_TYPE_GLOBAL, JS_READ_OBJ_BYTECODE, cached_data, cached_data_len, cache_rejected);
 
   JS_FreeCString(env->context, str);
 
@@ -1839,7 +1772,7 @@ js_prepare_script_with_code_cache(js_env_t *env, const char *file, size_t len, i
   script->foreign_context = NULL;
   script->foreign_bytecode = JS_UNDEFINED;
   script->name = name;
-  script->unit = js__create_unit(env, name, source_hash, bytecode);
+  script->unit = js__create_unit(env, name, bytecode);
 
   *result = script;
 
@@ -1850,7 +1783,7 @@ int
 js_create_script_code_cache(js_env_t *env, js_script_t *script, void **data, size_t *len) {
   if (JS_HasException(env->context)) return js__error(env);
 
-  return js__create_code_cache(env, script->bytecode, js__get_unit(script->unit)->source_hash, data, len);
+  return js__create_code_cache(env, script->bytecode, data, len);
 }
 
 // Compiled code belongs to the context it was compiled in, so a script run in
@@ -1980,11 +1913,9 @@ js_create_module_with_code_cache(js_env_t *env, const char *name, size_t len, in
   size_t str_len;
   const char *str = JS_ToCStringLen(env->context, &str_len, source->value);
 
-  uint64_t source_hash;
-
   // Both a module read from the cache and one compiled from source are left
   // unresolved, to be resolved by `js_instantiate_module()`.
-  JSValue bytecode = js__compile_with_code_cache(env, source->value, str, str_len, module_name, offset, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_DEFER_RESOLUTION, JS_READ_OBJ_BYTECODE | JS_READ_OBJ_DEFER_RESOLUTION, cached_data, cached_data_len, cache_rejected, &source_hash);
+  JSValue bytecode = js__compile_with_code_cache(env, source->value, str, str_len, module_name, offset, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_DEFER_RESOLUTION, JS_READ_OBJ_BYTECODE | JS_READ_OBJ_DEFER_RESOLUTION, cached_data, cached_data_len, cache_rejected);
 
   JS_FreeCString(env->context, str);
 
@@ -1998,7 +1929,7 @@ js_create_module_with_code_cache(js_env_t *env, const char *name, size_t len, in
 
   module->context = JS_DupContext(env->context);
   module->bytecode = bytecode;
-  module->unit = js__create_unit(env, module_name, source_hash, bytecode);
+  module->unit = js__create_unit(env, module_name, bytecode);
   module->definition = (JSModuleDef *) JS_VALUE_GET_PTR(bytecode);
   module->meta = cb;
   module->meta_data = data;
@@ -2029,7 +1960,7 @@ js_create_module_code_cache(js_env_t *env, js_module_t *module, void **data, siz
     return js__error(env);
   }
 
-  return js__create_code_cache(env, module->bytecode, js__get_unit(module->unit)->source_hash, data, len);
+  return js__create_code_cache(env, module->bytecode, data, len);
 }
 
 static int
@@ -2085,7 +2016,7 @@ js_create_synthetic_module(js_env_t *env, const char *name, size_t len, js_value
   module->name = js__copy_name(name, len);
   module->context = JS_DupContext(env->context);
   module->bytecode = JS_NULL;
-  module->unit = js__create_unit(env, module->name, 0, JS_NULL);
+  module->unit = js__create_unit(env, module->name, JS_NULL);
   module->definition = JS_NewCModule(env->context, module->name, js__on_evaluate_module);
   module->meta = NULL;
   module->meta_data = NULL;
@@ -3657,18 +3588,16 @@ js_compile_function_with_code_cache(js_env_t *env, const char *name, size_t name
   size_t buf_len;
   char *buf = js__function_source(env, name, name_len, args, args_len, source, &buf_len);
 
-  uint64_t source_hash;
-
   // The synthesized wrapper puts the source on the line after the one it
   // starts on.
-  JSValue bytecode = js__compile_with_code_cache(env, source->value, buf, buf_len, file, offset - 1, JS_EVAL_TYPE_GLOBAL, JS_READ_OBJ_BYTECODE, cached_data, cached_data_len, cache_rejected, &source_hash);
+  JSValue bytecode = js__compile_with_code_cache(env, source->value, buf, buf_len, file, offset - 1, JS_EVAL_TYPE_GLOBAL, JS_READ_OBJ_BYTECODE, cached_data, cached_data_len, cache_rejected);
 
   free(buf);
 
   if (JS_IsException(bytecode)) return js__report_exception(env);
 
   // The unit is held by the bytecode it is bound to.
-  JSValue unit = js__create_unit(env, file, source_hash, bytecode);
+  JSValue unit = js__create_unit(env, file, bytecode);
 
   JS_FreeValue(env->context, unit);
 
@@ -3738,7 +3667,7 @@ js_create_function_code_cache(js_env_t *env, js_value_t *function, void **data, 
     return js__error(env);
   }
 
-  err = js__create_code_cache(env, bytecode, js__get_unit(unit)->source_hash, data, len);
+  err = js__create_code_cache(env, bytecode, data, len);
 
   JS_FreeValue(env->context, bytecode);
   JS_FreeValue(env->context, unit);
