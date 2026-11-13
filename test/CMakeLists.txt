@@ -409,6 +409,11 @@ list(APPEND skipped_tests
   atomics-wait-timeout-notify
 
   # Not supported
+  compile-function-with-code-cache-rejected
+  create-module-with-code-cache-rejected
+  prepare-script-with-code-cache-rejected
+
+  # Not supported
   continuation-variable-promise-reaction
 
   # Not supported
