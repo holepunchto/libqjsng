@@ -42,19 +42,14 @@ add_library_targets(
     src/js.c
   LINK
     utf::<TYPE>
-  STATIC_LINK
-    uv_a
-    $<TARGET_PROPERTY:qjs,INTERFACE_LINK_LIBRARIES>
-  SHARED_LINK
-    uv
+    PRIVATE
+      intrusive::headers
+      qjs
+    STATIC
+      uv_a
+    SHARED
+      uv
   EXPORT OFF
-)
-
-target_link_libraries(
-  js
-  PRIVATE
-    qjs
-    intrusive::headers
 )
 
 target_sources(
@@ -62,14 +57,6 @@ target_sources(
   PRIVATE
     $<TARGET_OBJECTS:qjs>
 )
-
-if(TARGET js_shared)
-  target_link_libraries(
-    js_shared
-    PRIVATE
-      qjs
-  )
-endif()
 
 target_include_directories(
   js_headers
