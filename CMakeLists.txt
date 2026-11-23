@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 4.0)
 
 find_package(cmake-fetch REQUIRED PATHS node_modules/cmake-fetch)
+find_package(cmake-prelude REQUIRED PATHS node_modules/cmake-prelude)
+find_package(cmake-test REQUIRED PATHS node_modules/cmake-test)
 
-project(js C)
+project(js LANGUAGES C VERSION 0.0.0)
+
+fetch_package("github:holepunchto/libintrusive")
 
 set(QJS_ENABLE_INSTALL OFF CACHE BOOL "Enable QuickJS installation")
 
@@ -30,103 +34,25 @@ set_target_properties(
   POSITION_INDEPENDENT_CODE ${shared}
 )
 
-add_library(js OBJECT)
+add_library_targets(
+  js
+  FEATURES
+    c_std_99
+  SOURCES
+    src/js.c
+  LINK
+    utf::<TYPE>
+    PRIVATE
+      intrusive::headers
+    EMBED
+      qjs
+    STATIC
+      uv_a
+    SHARED
+      uv
+  EXPORT OFF
+)
 
 fetch_package("github:holepunchto/libjs" SOURCE_DIR js)
-fetch_package("github:holepunchto/libintrusive")
 
-set_target_properties(
-  js
-  PROPERTIES
-  C_STANDARD 99
-  POSITION_INDEPENDENT_CODE ${shared}
-)
-
-target_sources(
-  js
-  PRIVATE
-    src/js.c
-)
-
-target_include_directories(
-  js
-  INTERFACE
-    include
-  PUBLIC
-    ${js}/include
-  PRIVATE
-    $<TARGET_PROPERTY:qjs,INTERFACE_INCLUDE_DIRECTORIES>
-    $<TARGET_PROPERTY:uv,INTERFACE_INCLUDE_DIRECTORIES>
-    $<TARGET_PROPERTY:utf,INTERFACE_INCLUDE_DIRECTORIES>
-    $<TARGET_PROPERTY:intrusive,INTERFACE_INCLUDE_DIRECTORIES>
-)
-
-if(shared)
-  add_library(js_shared SHARED)
-
-  set_target_properties(
-    js_shared
-    PROPERTIES
-    OUTPUT_NAME js
-    WINDOWS_EXPORT_ALL_SYMBOLS ON
-  )
-
-  target_include_directories(
-    js_shared
-    INTERFACE
-      $<TARGET_PROPERTY:js,INTERFACE_INCLUDE_DIRECTORIES>
-  )
-
-  target_link_libraries(
-    js_shared
-    PUBLIC
-      uv
-      utf_shared
-    PRIVATE
-      js
-      qjs
-  )
-endif()
-
-add_library(js_static STATIC)
-
-target_sources(
-  js_static
-  PRIVATE
-    $<TARGET_OBJECTS:qjs>
-)
-
-set_target_properties(
-  js_static
-  PROPERTIES
-  OUTPUT_NAME js
-  PREFIX lib
-)
-
-target_include_directories(
-  js_static
-  INTERFACE
-    $<TARGET_PROPERTY:js,INTERFACE_INCLUDE_DIRECTORIES>
-)
-
-target_link_libraries(
-  js_static
-  PUBLIC
-    $<TARGET_PROPERTY:qjs,INTERFACE_LINK_LIBRARIES>
-    uv_a
-    utf_static
-  PRIVATE
-    js
-)
-
-install(TARGETS js_static)
-
-if(shared)
-  install(TARGETS js_shared)
-endif()
-
-if(PROJECT_IS_TOP_LEVEL)
-  enable_testing()
-
-  add_subdirectory(test)
-endif()
+add_test_subdirectory(test)

@@ -12,6 +12,8 @@
   },
   "homepage": "https://github.com/holepunchto/libqjsng#readme",
   "devDependencies": {
-    "cmake-fetch": "^1.0.0"
+    "cmake-fetch": "^1.0.0",
+    "cmake-prelude": "^0.1.4",
+    "cmake-test": "^0.1.5"
   }
 }
