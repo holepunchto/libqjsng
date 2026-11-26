@@ -212,6 +212,12 @@ struct js_script_s {
   char *name;
 };
 
+// A code cache may outlive the context that created it, so it holds its own
+// copy of the bytecode.
+struct js_code_cache_s {
+  void *data;
+};
+
 struct js_module_resolver_s {
   js_module_t *module;
   js_module_resolve_cb cb;
@@ -1383,7 +1389,7 @@ js_create_snapshot(uv_loop_t *loop, js_platform_t *platform, const js_snapshot_o
 }
 
 int
-js_take_snapshot(js_env_t *env, void **data, size_t *len) {
+js_take_snapshot(js_env_t *env, const void **data, size_t *len, js_snapshot_t **result) {
   if (JS_HasException(env->context)) return js__error(env);
 
   int err;
@@ -1392,6 +1398,11 @@ js_take_snapshot(js_env_t *env, void **data, size_t *len) {
   assert(err == 0);
 
   return js__error(env);
+}
+
+int
+js_release_snapshot(js_snapshot_t *snapshot) {
+  return -1;
 }
 
 static void
@@ -1477,7 +1488,7 @@ js__read_code_cache(js_env_t *env, const void *data, size_t len, int flags, bool
 }
 
 static int
-js__create_code_cache(js_env_t *env, JSValueConst bytecode, void **data, size_t *len) {
+js__create_code_cache(js_env_t *env, JSValueConst bytecode, const void **data, size_t *len, js_code_cache_t **result) {
   int err;
 
   // The source of each function is left out, as it would otherwise be loaded
@@ -1501,16 +1512,27 @@ js__create_code_cache(js_env_t *env, JSValueConst bytecode, void **data, size_t 
   }
 
   // `JS_WriteObject()` hands back a buffer owned by QuickJS that must be
-  // released with `js_free()`, whereas the caller releases the cache with
-  // `free()`.
-  uint8_t *copy = malloc(size);
+  // released with `js_free()`, whereas the cache may outlive the context.
+  js_code_cache_t *cache = malloc(sizeof(js_code_cache_t));
 
-  memcpy(copy, buffer, size);
+  cache->data = malloc(size);
+
+  memcpy(cache->data, buffer, size);
 
   js_free(env->context, buffer);
 
-  *data = copy;
+  *data = cache->data;
   *len = size;
+
+  *result = cache;
+
+  return 0;
+}
+
+int
+js_release_code_cache(js_code_cache_t *cache) {
+  free(cache->data);
+  free(cache);
 
   return 0;
 }
@@ -1867,10 +1889,10 @@ js_prepare_script_with_code_cache(js_env_t *env, const char *file, size_t len, i
 }
 
 int
-js_create_script_code_cache(js_env_t *env, js_script_t *script, void **data, size_t *len) {
+js_create_script_code_cache(js_env_t *env, js_script_t *script, const void **data, size_t *len, js_code_cache_t **result) {
   if (JS_HasException(env->context)) return js__error(env);
 
-  return js__create_code_cache(env, script->bytecode, data, len);
+  return js__create_code_cache(env, script->bytecode, data, len, result);
 }
 
 // Compiled code belongs to the context it was compiled in, so a script run in
@@ -2043,7 +2065,7 @@ js_create_module_with_code_cache(js_env_t *env, const char *name, size_t len, in
 }
 
 int
-js_create_module_code_cache(js_env_t *env, js_module_t *module, void **data, size_t *len) {
+js_create_module_code_cache(js_env_t *env, js_module_t *module, const void **data, size_t *len, js_code_cache_t **result) {
   if (JS_HasException(env->context)) return js__error(env);
 
   int err;
@@ -2059,7 +2081,7 @@ js_create_module_code_cache(js_env_t *env, js_module_t *module, void **data, siz
     return js__error(env);
   }
 
-  return js__create_code_cache(env, module->bytecode, data, len);
+  return js__create_code_cache(env, module->bytecode, data, len, result);
 }
 
 static int
@@ -3757,7 +3779,7 @@ js_compile_function_with_code_cache(js_env_t *env, const char *name, size_t name
 }
 
 int
-js_create_function_code_cache(js_env_t *env, js_value_t *function, void **data, size_t *len) {
+js_create_function_code_cache(js_env_t *env, js_value_t *function, const void **data, size_t *len, js_code_cache_t **result) {
   if (JS_HasException(env->context)) return js__error(env);
 
   int err;
@@ -3778,7 +3800,7 @@ js_create_function_code_cache(js_env_t *env, js_value_t *function, void **data, 
     return js__error(env);
   }
 
-  err = js__create_code_cache(env, bytecode, data, len);
+  err = js__create_code_cache(env, bytecode, data, len, result);
 
   JS_FreeValue(env->context, bytecode);
   JS_FreeValue(env->context, unit);
